@@ -1,5 +1,5 @@
 """
-Intraday ORB + VWAP Strategy BACKTEST (Updated for Render)
+Intraday ORB + VWAP Strategy BACKTEST (Render Web Service Ready)
 """
 
 import argparse
@@ -170,7 +170,6 @@ def simulate_ticker_day(day_df, pivots, capital_start_of_day):
         if row.name <= or_cutoff:
             continue
 
-        # No trade after 1:00 PM
         if row.name.hour >= MAX_ENTRY_HOUR:
             break
 
@@ -238,7 +237,6 @@ def simulate_ticker_day(day_df, pivots, capital_start_of_day):
     risk_amount = capital_start_of_day * (RISK_PER_TRADE_PCT / 100)
     qty = max(1, int(risk_amount // risk))
 
-    # Walk forward + Square off at 2:30 PM
     outcome, exit_price, exit_time = None, None, None
     for j in range(entry_idx + 1, len(day_df)):
         future_row = day_df.iloc[j]
@@ -257,7 +255,6 @@ def simulate_ticker_day(day_df, pivots, capital_start_of_day):
             break
 
     if outcome is None:
-        # Square off at ~2:30 PM
         square_off_time = None
         for j in range(entry_idx + 1, len(day_df)):
             future_row = day_df.iloc[j]
@@ -354,7 +351,6 @@ def run_backtest(tickers, days):
     return all_trades, capital, capital_curve
 
 
-# Excel Output Functions (unchanged)
 TRADE_COLUMNS = ["EntryDate", "EntryTime", "Ticker", "Signal", "Entry", "Stop", "Target",
                   "RRRatio", "Qty", "RiskAmount", "ExitTime", "ExitPrice", "Outcome",
                   "PnL", "PnLPct", "CapitalAfter"]
@@ -418,6 +414,39 @@ def write_excel(trades, starting_capital, ending_capital, capital_curve):
         symbol_ws.append([ticker, s["trades"], s["wins"], wr, round(s["pnl"], 2)])
 
     wb.save(OUTPUT_FILE)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Backtest the ORB+VWAP strategy on historical data")
+    parser.add_argument("--tickers", type=str, default=None,
+                         help="Comma-separated tickers instead of the full Nifty 100")
+    parser.add_argument("--days", type=int, default=MAX_LOOKBACK_DAYS,
+                         help=f"Lookback days for 5m data (max ~{MAX_LOOKBACK_DAYS}, Yahoo's own limit)")
+    args = parser.parse_args()
+
+    days = min(args.days, MAX_LOOKBACK_DAYS)
+    tickers = ([t.strip() for t in args.tickers.split(",") if t.strip()]
+               if args.tickers else get_nifty_100_tickers())
+
+    trades, ending_capital, capital_curve = run_backtest(tickers, days)
+
+    if not trades:
+        print("\nNo trades were generated...")
+        return
+
+    write_excel(trades, BACKTEST_CAPITAL, ending_capital, capital_curve)
+
+    wins = sum(1 for t in trades if "WIN" in t["Outcome"])
+    print(f"\n{'='*60}")
+    print(f"BACKTEST COMPLETE")
+    print(f"  Total trades:     {len(trades)}")
+    print(f"  Win rate:         {round(wins/len(trades)*100, 1)}%")
+    print(f"  Starting capital: Rs.{BACKTEST_CAPITAL:,.2f}")
+    print(f"  Ending capital:   Rs.{ending_capital:,.2f}")
+    print(f"  Return:           {round((ending_capital-BACKTEST_CAPITAL)/BACKTEST_CAPITAL*100, 2)}%")
+    print(f"  Max drawdown:     {max_drawdown_pct(capital_curve)}%")
+    print(f"  Full detail in:   {OUTPUT_FILE}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
