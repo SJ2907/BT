@@ -71,8 +71,12 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
+from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
 import pytz
@@ -493,38 +497,200 @@ def write_excel(trades, starting_capital, ending_capital, capital_curve):
     wb.save(OUTPUT_FILE)
 
 
+# --------------------------- STANDALONE WEB SERVER --------------------------
+# This lets the BACKTEST run as its own independent Render "Web Service"
+# (kept fully separate from the live bot, as requested). It binds a port
+# immediately (satisfying Render's requirement), then waits for you to
+# trigger a run by visiting a URL -- since a backtest can take several
+# minutes, running it as an immediate blocking HTTP request would time out.
+
+backtest_status = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "result_summary": None,
+    "error": None,
+}
+
+
+def _run_backtest_background(days, tickers_arg):
+    backtest_status["running"] = True
+    backtest_status["started_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    backtest_status["error"] = None
+    try:
+        tickers = ([t.strip() for t in tickers_arg.split(",") if t.strip()]
+                   if tickers_arg else get_nifty_100_tickers())
+        days = min(days, MAX_LOOKBACK_DAYS)
+        trades, ending_capital, curve = run_backtest(tickers, days)
+        if trades:
+            write_excel(trades, BACKTEST_CAPITAL, ending_capital, curve)
+            wins = sum(1 for t in trades if "WIN" in t["Outcome"])
+            backtest_status["result_summary"] = (
+                f"{len(trades)} trades, win rate {round(wins/len(trades)*100,1)}%, "
+                f"ended at Rs.{round(ending_capital,2)} (started Rs.{BACKTEST_CAPITAL:,.2f}), "
+                f"max drawdown {max_drawdown_pct(curve)}%"
+            )
+        else:
+            backtest_status["result_summary"] = "No trades were generated -- check server logs."
+    except Exception as e:
+        backtest_status["error"] = str(e)
+    finally:
+        backtest_status["running"] = False
+        backtest_status["finished_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class _BacktestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/run-backtest"):
+            self._trigger()
+        elif self.path.startswith("/status"):
+            self._status()
+        elif self.path.startswith("/download"):
+            self._download()
+        else:
+            self._home()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+
+    def _home(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        lines = [
+            "Backtest service alive.",
+            "",
+            "Visit /run-backtest to start a backtest (runs in the background).",
+            "  Optional: /run-backtest?days=30&tickers=RELIANCE.NS,TCS.NS",
+            "Visit /status to check progress.",
+            "Visit /download to get backtest_journal.xlsx once finished.",
+        ]
+        self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
+
+    def _trigger(self):
+        if backtest_status["running"]:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"A backtest is already running. Check /status.\n")
+            return
+        query = parse_qs(urlparse(self.path).query)
+        days = int(query.get("days", [MAX_LOOKBACK_DAYS])[0])
+        tickers_arg = query.get("tickers", [None])[0]
+        thread = threading.Thread(target=_run_backtest_background,
+                                   args=(days, tickers_arg), daemon=True)
+        thread.start()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(
+            (f"Backtest started ({days} days). This can take several minutes for the\n"
+             f"full Nifty 100 list. Check /status for progress, and /download once done.\n"
+             ).encode("utf-8")
+        )
+
+    def _status(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        lines = [
+            f"Running: {backtest_status['running']}",
+            f"Started at: {backtest_status['started_at']}",
+            f"Finished at: {backtest_status['finished_at']}",
+            f"Result: {backtest_status['result_summary']}",
+            f"Error (if any): {backtest_status['error']}",
+        ]
+        self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
+
+    def _download(self):
+        if not os.path.exists(OUTPUT_FILE):
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"No backtest_journal.xlsx yet -- visit /run-backtest first.\n")
+            return
+        try:
+            with open(OUTPUT_FILE, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type",
+                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", "attachment; filename=backtest_journal.xlsx")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"Error reading file: {e}\n".encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _BacktestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Backtest web server listening on port {port}.")
+    print(f"Visit this service's Render URL to see instructions, "
+          f"/run-backtest to start, /status to check, /download when done.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest the ORB+VWAP strategy on historical data")
     parser.add_argument("--tickers", type=str, default=None,
                          help="Comma-separated tickers instead of the full Nifty 100")
     parser.add_argument("--days", type=int, default=MAX_LOOKBACK_DAYS,
                          help=f"Lookback days for 5m data (max ~{MAX_LOOKBACK_DAYS}, Yahoo's own limit)")
+    parser.add_argument("--once", action="store_true",
+                         help="Run once immediately in this terminal and exit (for use via "
+                              "Render's Shell tab, or running locally). Without this flag, "
+                              "the script instead starts a web server and waits for you to "
+                              "trigger a run via /run-backtest -- use this mode when deploying "
+                              "as a Render Web Service.")
     args = parser.parse_args()
 
-    days = min(args.days, MAX_LOOKBACK_DAYS)
-    tickers = ([t.strip() for t in args.tickers.split(",") if t.strip()]
-               if args.tickers else get_nifty_100_tickers())
+    if args.once:
+        days = min(args.days, MAX_LOOKBACK_DAYS)
+        tickers = ([t.strip() for t in args.tickers.split(",") if t.strip()]
+                   if args.tickers else get_nifty_100_tickers())
 
-    trades, ending_capital, capital_curve = run_backtest(tickers, days)
+        trades, ending_capital, capital_curve = run_backtest(tickers, days)
 
-    if not trades:
-        print("\nNo trades were generated at all -- either the filters are very strict, "
-              "or data fetch failed for most tickers. Check the [warn] lines above.")
+        if not trades:
+            print("\nNo trades were generated at all -- either the filters are very strict, "
+                  "or data fetch failed for most tickers. Check the [warn] lines above.")
+            return
+
+        write_excel(trades, BACKTEST_CAPITAL, ending_capital, capital_curve)
+
+        wins = sum(1 for t in trades if "WIN" in t["Outcome"])
+        print(f"\n{'='*60}")
+        print(f"BACKTEST COMPLETE")
+        print(f"  Total trades:     {len(trades)}")
+        print(f"  Win rate:         {round(wins/len(trades)*100, 1)}%")
+        print(f"  Starting capital: Rs.{BACKTEST_CAPITAL:,.2f}")
+        print(f"  Ending capital:   Rs.{ending_capital:,.2f}")
+        print(f"  Return:           {round((ending_capital-BACKTEST_CAPITAL)/BACKTEST_CAPITAL*100, 2)}%")
+        print(f"  Max drawdown:     {max_drawdown_pct(capital_curve)}%")
+        print(f"  Full detail in:   {OUTPUT_FILE}")
+        print(f"{'='*60}")
         return
 
-    write_excel(trades, BACKTEST_CAPITAL, ending_capital, capital_curve)
-
-    wins = sum(1 for t in trades if "WIN" in t["Outcome"])
-    print(f"\n{'='*60}")
-    print(f"BACKTEST COMPLETE")
-    print(f"  Total trades:     {len(trades)}")
-    print(f"  Win rate:         {round(wins/len(trades)*100, 1)}%")
-    print(f"  Starting capital: Rs.{BACKTEST_CAPITAL:,.2f}")
-    print(f"  Ending capital:   Rs.{ending_capital:,.2f}")
-    print(f"  Return:           {round((ending_capital-BACKTEST_CAPITAL)/BACKTEST_CAPITAL*100, 2)}%")
-    print(f"  Max drawdown:     {max_drawdown_pct(capital_curve)}%")
-    print(f"  Full detail in:   {OUTPUT_FILE}")
-    print(f"{'='*60}")
+    # Default (no --once): stay alive as a web service, waiting for triggers.
+    start_web_server()
+    print("Waiting for a backtest to be triggered via /run-backtest. Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\nStopped by user. Goodbye!")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
