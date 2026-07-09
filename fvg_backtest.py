@@ -207,42 +207,74 @@ def simulate_ticker(ticker, df):
                 in_position = False
                 continue
 
-            price = float(row["Close"])
             risk = abs(entry_price - stop_price)
+            # FIX: check High/Low for whether price actually TOUCHED the
+            # stop/target, exiting at that level (or the Open if it gapped
+            # through) -- not just at whatever the candle's Close happened
+            # to be. See breakout_pullback_backtest.py's notes for the full
+            # explanation of why this matters (it was overstating losses).
             if direction == "BULLISH":
-                if price >= target:
+                if row["Open"] <= trailing_stop:
+                    exit_price = float(row["Open"])
+                elif row["Low"] <= trailing_stop:
+                    exit_price = trailing_stop
+                else:
+                    exit_price = None
+                if exit_price is not None:
                     raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
                                                     entry_price, stop_price, target, row.name,
-                                                    price, "TARGET_HIT"))
+                                                    exit_price, "STOP_HIT"))
                     in_position = False
                     continue
-                if (price - entry_price) / risk >= TRAIL_TO_BE_R:
+
+                if row["Open"] >= target:
+                    exit_price = float(row["Open"])
+                elif row["High"] >= target:
+                    exit_price = target
+                else:
+                    exit_price = None
+                if exit_price is not None:
+                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
+                                                    entry_price, stop_price, target, row.name,
+                                                    exit_price, "TARGET_HIT"))
+                    in_position = False
+                    continue
+
+                if (float(row["High"]) - entry_price) / risk >= TRAIL_TO_BE_R:
                     trailing_stop = max(trailing_stop, entry_price)
                     lookback_low = float(df.iloc[max(0, i - TRAIL_LOOKBACK_CANDLES):i]["Low"].min())
                     trailing_stop = max(trailing_stop, lookback_low)
-                if price <= trailing_stop:
-                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                    entry_price, stop_price, target, row.name,
-                                                    price, "TRAIL_STOP_HIT"))
-                    in_position = False
-                    continue
             else:
-                if price <= target:
+                if row["Open"] >= trailing_stop:
+                    exit_price = float(row["Open"])
+                elif row["High"] >= trailing_stop:
+                    exit_price = trailing_stop
+                else:
+                    exit_price = None
+                if exit_price is not None:
                     raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
                                                     entry_price, stop_price, target, row.name,
-                                                    price, "TARGET_HIT"))
+                                                    exit_price, "STOP_HIT"))
                     in_position = False
                     continue
-                if (entry_price - price) / risk >= TRAIL_TO_BE_R:
+
+                if row["Open"] <= target:
+                    exit_price = float(row["Open"])
+                elif row["Low"] <= target:
+                    exit_price = target
+                else:
+                    exit_price = None
+                if exit_price is not None:
+                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
+                                                    entry_price, stop_price, target, row.name,
+                                                    exit_price, "TARGET_HIT"))
+                    in_position = False
+                    continue
+
+                if (entry_price - float(row["Low"])) / risk >= TRAIL_TO_BE_R:
                     trailing_stop = min(trailing_stop, entry_price)
                     lookback_high = float(df.iloc[max(0, i - TRAIL_LOOKBACK_CANDLES):i]["High"].max())
                     trailing_stop = min(trailing_stop, lookback_high)
-                if price >= trailing_stop:
-                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                    entry_price, stop_price, target, row.name,
-                                                    price, "TRAIL_STOP_HIT"))
-                    in_position = False
-                    continue
             continue
 
         # --- Not in a position: monitor a pending FVG, or look for a new one ---
