@@ -94,7 +94,7 @@ MAX_DAILY_RISK_PCT = 30.0
 CANDLE_INTERVAL = "5m"
 MAX_LOOKBACK_DAYS = 59
 
-TOP_N_GAINERS = 20          # how many previous-day top gainers to scan each day
+TOP_N_GAINERS = 10          # how many previous-day top gainers to scan each day
 
 WICK_RATIO = 0.6            # rejection wick must be >= this fraction of the candle's range
 BOX_TOUCH_BUFFER_PCT = 0.2  # how close to the box level counts as "touching"
@@ -102,8 +102,10 @@ SL_BUFFER_PCT = 0.2         # stop placed this % beyond the rejection candle's o
 TARGET_RR = 2.0
 MAX_HOLD_CANDLES = 12       # ~1 hour on 5-min candles, matching the reference's default
 
-NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE = 14, 30
-EXIT_HOUR, EXIT_MINUTE = 15, 0
+NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE = 13, 30   # 1:30 PM -- leaves room for a
+                                                        # full 1-hour hold before the
+                                                        # mandatory 2:30 PM close below
+EXIT_HOUR, EXIT_MINUTE = 14, 30                        # mandatory flat-by 2:30 PM
 
 IST = pytz.timezone("Asia/Kolkata")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -404,6 +406,10 @@ def run_backtest(days):
 
     all_raw_trades, all_signals = [], []
     for day, top_tickers in sorted(rankings.items()):
+        # ONLY ONE TRADE PER DAY, TOTAL -- scan the top gainers in rank order
+        # (strongest gainer first) and stop as soon as one produces a trade.
+        # Tickers ranked below the one that fires are never even checked
+        # that day, matching "find my one trade for the day and stop looking."
         for ticker in top_tickers:
             idf = intraday_data.get(ticker)
             ddf = daily_data.get(ticker)
@@ -427,6 +433,7 @@ def run_backtest(days):
             all_signals.extend(signals)
             if trade:
                 all_raw_trades.append(trade)
+                break  # got today's one trade -- stop scanning remaining tickers
 
     print(f"\n{len(all_signals)} wick rejections detected, {len(all_raw_trades)} trades triggered. "
           f"Applying position sizing...")
@@ -496,6 +503,24 @@ def write_excel(trades, starting_capital, ending_capital, capital_curve, all_sig
     for ticker, s in sorted(by_symbol.items(), key=lambda x: -x[1]["pnl"]):
         wr = round(s["wins"] / s["trades"] * 100, 2) if s["trades"] else 0
         symbol_ws.append([ticker, s["trades"], s["wins"], wr, round(s["pnl"], 2)])
+
+    # Separate Bullish / Bearish sheets, each with their own win rate up top
+    for direction_label, sheet_name in [("BULLISH", "Bullish"), ("BEARISH", "Bearish")]:
+        subset = [t for t in trades if t["Direction"] == direction_label]
+        d_ws = wb.create_sheet(sheet_name)
+        d_wins = sum(1 for t in subset if t["Outcome"] == "WIN")
+        d_total = len(subset)
+        d_win_rate = round(d_wins / d_total * 100, 2) if d_total else 0
+        d_pnl = round(sum(t["PnL"] for t in subset), 2)
+        d_ws.append(["Total Trades", d_total])
+        d_ws.append(["Wins", d_wins])
+        d_ws.append(["Losses", d_total - d_wins])
+        d_ws.append(["Win Rate %", d_win_rate])
+        d_ws.append(["Total P&L", d_pnl])
+        d_ws.append([])  # blank separator row
+        d_ws.append(TRADE_COLUMNS)
+        for t in subset:
+            d_ws.append([t.get(c, "") for c in TRADE_COLUMNS])
 
     signals_ws = wb.create_sheet("AllSignals")
     signals_ws.append(SIGNAL_COLUMNS)
