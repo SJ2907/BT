@@ -1,50 +1,58 @@
 """
-Fair Value Gap (FVG) Strategy BACKTEST (Indian Stock Market - NSE)
-=====================================================================
-Fully SEPARATE from the live bot, the ORB backtest (BT), and the
-breakout-pullback backtest. Doesn't touch or import any of them.
+Box Rejection ("Wick") Strategy BACKTEST -- Previous-Day Top-20 Gainers
+=========================================================================
+(Indian Stock Market - NSE)
+
+Fully SEPARATE from the live bot and every other backtest script here.
+Doesn't touch or import any of them.
+
+Adapted from a reference "Box Theory" script, but rebuilt on our own
+validated backtest framework -- the reference's own backtest logic never
+actually recorded real per-trade P&L; its "equity curve" was a disconnected
+approximation that didn't match its own entry/exit rules. This version
+uses proper trade-by-trade simulation with real position sizing, matching
+the ORB/breakout-pullback/FVG/BAG backtests already built.
+
+KEY DIFFERENCE FROM THE OTHER BACKTESTS: the tradeable universe ROTATES
+DAILY. Instead of scanning the full Nifty 100 every day, each day only
+scans that day's TOP_N_GAINERS stocks (by previous day's % gain, ranked
+across the Nifty 100). The idea: stocks with recent relative strength may
+behave differently at support/resistance than a static universe would
+capture.
 
 STRATEGY LOGIC
 --------------
-1. GAP DETECTION (3 consecutive candles: c1, c2, c3):
-     Bullish gap: c1.High < c3.Low  (a void/imbalance left behind by c2)
-     Bearish gap: c1.Low  > c3.High
-   c2 (the middle, "displacement" candle) must show real force -- an
-   unusually large body AND unusually high volume vs recent averages --
-   to filter out tiny, meaningless gaps.
+1. THE "BOX": previous trading day's High and Low act as a support/
+   resistance zone for today's session.
 
-2. CLASSIFICATION (this is what separates FVG from a Breakaway Gap):
-     FVG: c3 closes WITHIN or touching c2's own range/body -- price didn't
-          run away, it's still "filling orders" near the impulsive candle.
-     (A close that instead runs well beyond c2's high/low is a Breakaway
-     Gap, not an FVG -- see bag_backtest.py for that side of the same
-     pattern.)
+2. THE "WICK" (rejection candle):
+     Bullish: a candle whose LOWER wick is a large majority (>=WICK_RATIO)
+              of its total range, with the low touching at or near the
+              box's low (within BOX_TOUCH_BUFFER_PCT) -- price dipped to
+              yesterday's low, got rejected, and closed back up.
+     Bearish: the mirror -- long upper wick rejecting at/near yesterday's
+              high.
 
-3. FVG ENTRY -- do NOT chase: wait for price to retrace back INTO the gap
-   zone (between c1's extreme and c3's extreme) and show a reaction candle
-   in the original direction (closes bullish, holding above the zone's
-   lower edge, for a bullish FVG). That reaction candle's close is the
-   entry. If price hasn't reacted within FVG_RETEST_MAX_CANDLES, or closes
-   decisively through the zone instead, the setup is abandoned.
-
-4. RISK MANAGEMENT: stop just beyond the far edge of the gap zone; target
-   = the larger of (c2's own range projected forward) or a fixed R-multiple.
-   Trailing stop only activates after real profit (past TRAIL_TO_BE_R), and
-   then trails behind a short rolling window -- NOT a single-candle trail,
-   which was proven (in the breakout-pullback backtest) to choke trades
-   almost immediately on ordinary noise.
+3. ENTRY: at the rejection candle's own close. Stop just beyond that same
+   candle's extreme (its low, for a bullish rejection). Target = a fixed
+   R-multiple of that risk (TARGET_RR, default 2.0, matching the
+   reference). Time-boxed: exit after MAX_HOLD_CANDLES if neither stop nor
+   target is hit, in addition to the usual mandatory EOD square-off.
 
 IMPORTANT LIMITATIONS
 --------------------------------------------------------------------------
 - Same ~60-day cap on 5-minute data as the other backtests (Yahoo's limit).
 - No brokerage/STT/slippage modeled.
-- Today's Nifty 100 list used for the whole window (minor survivorship bias).
+- Needs at least 2 prior trading days of daily closes before the first
+  tradeable day, to compute "previous day's % gain" for ranking -- so the
+  very start of the backtest window has no ranking yet.
+- Today's Nifty 100 list is used as the ranking universe for the whole
+  window (same minor survivorship-bias caveat as the other backtests).
 - MAX_DAILY_RISK_PCT caps total risk committed across all simultaneous
-  signals on one day, so a cluster of same-day gaps can't silently stack
-  into an outsized single-day loss.
-- This "FVG works" idea is popular in retail/ICT trading circles but has
-  no strong independent evidence behind it -- that's exactly why this
-  script exists: to test it on real data rather than assume it.
+  signals on one day.
+- Exits check High/Low for actual level touches (not just candle Close),
+  matching the fix applied to the other backtests -- avoids overstating
+  losses from a stop that gets "noticed" several candles late.
 - Research simulation only, not a guarantee of live results.
 
 REQUIREMENTS
@@ -53,11 +61,11 @@ REQUIREMENTS
 
 HOW TO RUN
 ----------
-    python3 fvg_backtest.py --once                      # run now, in this terminal, then exit
-    python3 fvg_backtest.py --once --tickers RELIANCE.NS,TCS.NS
-    python3 fvg_backtest.py                             # web-service mode (for Render):
-                                                         #   binds a port, waits for a
-                                                         #   trigger at /run-backtest
+    python3 box_wick_backtest.py --once                     # run now, in this terminal, then exit
+    python3 box_wick_backtest.py --once --days 30
+    python3 box_wick_backtest.py                             # web-service mode (for Render):
+                                                              #   binds a port, waits for a
+                                                              #   trigger at /run-backtest
 """
 
 import argparse
@@ -86,32 +94,27 @@ MAX_DAILY_RISK_PCT = 30.0
 CANDLE_INTERVAL = "5m"
 MAX_LOOKBACK_DAYS = 59
 
-# --- Gap detection ---
-DISPLACEMENT_BODY_MULT = 1.5   # c2's body must be >= this x the recent average body
-DISPLACEMENT_VOL_MULT = 2.0    # c2's volume must be >= this x the 20-candle average
-MIN_GAP_PCT = 0.15             # gap size must be at least this % of price, to skip noise
+TOP_N_GAINERS = 20          # how many previous-day top gainers to scan each day
 
-# --- FVG entry (wait for retracement + reaction) ---
-FVG_RETEST_MAX_CANDLES = 15    # give up waiting for a reaction after this many candles
-SL_BUFFER_PCT = 0.1
-TARGET_RR = 2.5
-MEASURED_MOVE_MULT = 1.0       # project c2's own range forward by this multiple
+WICK_RATIO = 0.6            # rejection wick must be >= this fraction of the candle's range
+BOX_TOUCH_BUFFER_PCT = 0.2  # how close to the box level counts as "touching"
+SL_BUFFER_PCT = 0.2         # stop placed this % beyond the rejection candle's own extreme
+TARGET_RR = 2.0
+MAX_HOLD_CANDLES = 12       # ~1 hour on 5-min candles, matching the reference's default
 
-# --- Trailing stop (fixed design -- see breakout_pullback_backtest.py notes) ---
-TRAIL_TO_BE_R = 1.2
-TRAIL_LOOKBACK_CANDLES = 4
-
-NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE = 14, 0    # no NEW entries after 2:00 PM
-EXIT_HOUR, EXIT_MINUTE = 15, 0                         # mandatory flat-by time
+NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE = 14, 30
+EXIT_HOUR, EXIT_MINUTE = 15, 0
 
 IST = pytz.timezone("Asia/Kolkata")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_FILE = os.path.join(SCRIPT_DIR, "fvg_journal.xlsx")
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "box_wick_journal.xlsx")
 NIFTY100_SOURCE_URL = "https://niftyindices.com/IndexConstituent/ind_nifty100list.csv"
 
 FALLBACK_TICKERS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
     "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
+    "LT.NS", "BAJFINANCE.NS", "HCLTECH.NS", "AXISBANK.NS", "ASIANPAINT.NS",
+    "MARUTI.NS", "SUNPHARMA.NS", "TITAN.NS", "ULTRACEMCO.NS", "WIPRO.NS",
 ]
 
 # ============================ END CONFIG ==================================
@@ -139,7 +142,7 @@ def fetch_intraday_history(ticker, days):
         df = yf.download(ticker, period=f"{days}d", interval=CANDLE_INTERVAL,
                           progress=False, auto_adjust=False)
     except Exception as e:
-        print(f"  [warn] fetch failed for {ticker}: {e}")
+        print(f"  [warn] intraday fetch failed for {ticker}: {e}")
         return None
     if df is None or df.empty:
         return None
@@ -148,265 +151,179 @@ def fetch_intraday_history(ticker, days):
     return df
 
 
-def precompute_indicators(df):
-    body = (df["Close"] - df["Open"])
-    df["_avg_body_prior"] = body.abs().shift(1).rolling(10).mean()
-    df["_avg_vol"] = df["Volume"].rolling(20).mean()
+def fetch_daily_history(ticker, days):
+    try:
+        df = yf.download(ticker, period=f"{days + 15}d", interval="1d",
+                          progress=False, auto_adjust=False)
+    except Exception as e:
+        print(f"  [warn] daily fetch failed for {ticker}: {e}")
+        return None
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     return df
+
+
+# ------------------------------ RANKING -------------------------------------
+
+def build_daily_rankings(daily_data):
+    """For each day present in the data, ranks tickers by their % gain on
+    the PRIOR trading day (Close-to-Close), and returns
+    {date: [ticker1, ticker2, ...]} with only the top TOP_N_GAINERS kept.
+    Only uses data strictly before `date` -- no look-ahead."""
+    # Build a single {ticker: {date: close}} lookup
+    closes = {}
+    all_dates = set()
+    for ticker, df in daily_data.items():
+        closes[ticker] = {d.date(): float(c) for d, c in zip(df.index, df["Close"])}
+        all_dates.update(closes[ticker].keys())
+
+    sorted_dates = sorted(all_dates)
+    rankings = {}
+
+    for idx, today in enumerate(sorted_dates):
+        if idx < 2:
+            continue  # need at least 2 prior closes to compute yesterday's % gain
+        yesterday = sorted_dates[idx - 1]
+        day_before = sorted_dates[idx - 2]
+
+        gains = []
+        for ticker, close_map in closes.items():
+            if yesterday in close_map and day_before in close_map and close_map[day_before] > 0:
+                pct_gain = (close_map[yesterday] - close_map[day_before]) / close_map[day_before] * 100
+                gains.append((ticker, pct_gain))
+
+        gains.sort(key=lambda x: -x[1])
+        rankings[today] = [t for t, _ in gains[:TOP_N_GAINERS]]
+
+    return rankings
+
+
+# ------------------------------ STRATEGY CORE ------------------------------
+
+def is_bullish_wick(row, box_low):
+    total_range = row["High"] - row["Low"]
+    if total_range <= 0:
+        return False
+    lower_wick = min(row["Open"], row["Close"]) - row["Low"]
+    return (lower_wick / total_range >= WICK_RATIO) and (row["Low"] <= box_low * (1 + BOX_TOUCH_BUFFER_PCT / 100))
+
+
+def is_bearish_wick(row, box_high):
+    total_range = row["High"] - row["Low"]
+    if total_range <= 0:
+        return False
+    upper_wick = row["High"] - max(row["Open"], row["Close"])
+    return (upper_wick / total_range >= WICK_RATIO) and (row["High"] >= box_high * (1 - BOX_TOUCH_BUFFER_PCT / 100))
 
 
 def _time_at_or_after(row_time, hour, minute):
     return row_time >= pd.Timestamp(f"{hour}:{minute}").time()
 
 
-def _within_time(row_time, hour, minute):
-    return row_time <= pd.Timestamp(f"{hour}:{minute}").time()
-
-
-# ------------------------------ STRATEGY CORE ------------------------------
-
-def simulate_ticker(ticker, df):
-    """Returns (raw_trades, all_signals) -- raw_trades only contains signals
-    that actually got an entry triggered (for position sizing later);
-    all_signals logs EVERY gap detected that day, whether or not price ever
-    retraced into it and triggered an entry."""
-    df = precompute_indicators(df)
-    raw_trades = []
+def simulate_ticker_day(ticker, day_df, box_high, box_low):
+    """Looks for ONE wick-rejection trade on this ticker's single day of
+    candles. Returns (raw_trade_or_None, all_signals_this_day)."""
     all_signals = []
+    n = len(day_df)
 
-    in_position = False
-    entry_price = stop_price = trailing_stop = target = None
-    entry_time = direction = None
-    signal_id = None
-    current_day = None
-
-    # Active (unfilled) FVG setup awaiting a retracement + reaction
-    pending = None  # dict or None
-
-    n = len(df)
     for i in range(n):
-        row = df.iloc[i]
+        row = day_df.iloc[i]
         row_time = row.name.time()
-        row_day = row.name.date()
+        if _time_at_or_after(row_time, NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE):
+            break
 
-        if row_day != current_day:
-            current_day = row_day
-            pending = None
-            in_position = False
-
-        if i < 25:
+        bullish = is_bullish_wick(row, box_low)
+        bearish = is_bearish_wick(row, box_high)
+        if not bullish and not bearish:
             continue
 
-        # --- Manage an open position first ---
-        if in_position:
-            if _time_at_or_after(row_time, EXIT_HOUR, EXIT_MINUTE):
-                exit_price = float(row["Close"])
-                raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                entry_price, stop_price, target, row.name,
-                                                exit_price, "EOD_SQUAREOFF"))
-                in_position = False
-                continue
+        direction = "BULLISH" if bullish else "BEARISH"
+        sig_id = str(uuid.uuid4())[:8]
+        all_signals.append({
+            "SignalId": sig_id, "Date": row.name.strftime("%Y-%m-%d"),
+            "DetectedTime": row.name.strftime("%H:%M:%S"), "Ticker": ticker,
+            "Direction": direction, "BoxHigh": round(box_high, 2), "BoxLow": round(box_low, 2),
+            "EntryTriggered": True, "EntryTime": row.name.strftime("%H:%M:%S"),
+        })
 
-            risk = abs(entry_price - stop_price)
-            # FIX: check High/Low for whether price actually TOUCHED the
-            # stop/target, exiting at that level (or the Open if it gapped
-            # through) -- not just at whatever the candle's Close happened
-            # to be. See breakout_pullback_backtest.py's notes for the full
-            # explanation of why this matters (it was overstating losses).
+        entry_price = float(row["Close"])
+        if direction == "BULLISH":
+            stop_price = float(row["Low"]) * (1 - SL_BUFFER_PCT / 100)
+            risk = entry_price - stop_price
+            if risk <= 0:
+                continue
+            target = entry_price + TARGET_RR * risk
+        else:
+            stop_price = float(row["High"]) * (1 + SL_BUFFER_PCT / 100)
+            risk = stop_price - entry_price
+            if risk <= 0:
+                continue
+            target = entry_price - TARGET_RR * risk
+
+        entry_time = row.name
+        entry_idx = i
+
+        # Walk forward: check High/Low touches (not just Close), a
+        # max-hold-candles cap, and the mandatory EOD square-off.
+        exit_price, exit_time, exit_reason = None, None, None
+        for j in range(entry_idx + 1, n):
+            frow = day_df.iloc[j]
+            frow_time = frow.name.time()
+
+            if _time_at_or_after(frow_time, EXIT_HOUR, EXIT_MINUTE):
+                exit_price, exit_time, exit_reason = float(frow["Close"]), frow.name, "EOD_SQUAREOFF"
+                break
+
             if direction == "BULLISH":
-                if row["Open"] <= trailing_stop:
-                    exit_price = float(row["Open"])
-                elif row["Low"] <= trailing_stop:
-                    exit_price = trailing_stop
-                else:
-                    exit_price = None
-                if exit_price is not None:
-                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                    entry_price, stop_price, target, row.name,
-                                                    exit_price, "STOP_HIT"))
-                    in_position = False
-                    continue
-
-                if row["Open"] >= target:
-                    exit_price = float(row["Open"])
-                elif row["High"] >= target:
-                    exit_price = target
-                else:
-                    exit_price = None
-                if exit_price is not None:
-                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                    entry_price, stop_price, target, row.name,
-                                                    exit_price, "TARGET_HIT"))
-                    in_position = False
-                    continue
-
-                if (float(row["High"]) - entry_price) / risk >= TRAIL_TO_BE_R:
-                    trailing_stop = max(trailing_stop, entry_price)
-                    lookback_low = float(df.iloc[max(0, i - TRAIL_LOOKBACK_CANDLES):i]["Low"].min())
-                    trailing_stop = max(trailing_stop, lookback_low)
+                if frow["Open"] <= stop_price:
+                    exit_price, exit_time, exit_reason = float(frow["Open"]), frow.name, "STOP_HIT"
+                    break
+                if frow["Low"] <= stop_price:
+                    exit_price, exit_time, exit_reason = stop_price, frow.name, "STOP_HIT"
+                    break
+                if frow["Open"] >= target:
+                    exit_price, exit_time, exit_reason = float(frow["Open"]), frow.name, "TARGET_HIT"
+                    break
+                if frow["High"] >= target:
+                    exit_price, exit_time, exit_reason = target, frow.name, "TARGET_HIT"
+                    break
             else:
-                if row["Open"] >= trailing_stop:
-                    exit_price = float(row["Open"])
-                elif row["High"] >= trailing_stop:
-                    exit_price = trailing_stop
-                else:
-                    exit_price = None
-                if exit_price is not None:
-                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                    entry_price, stop_price, target, row.name,
-                                                    exit_price, "STOP_HIT"))
-                    in_position = False
-                    continue
+                if frow["Open"] >= stop_price:
+                    exit_price, exit_time, exit_reason = float(frow["Open"]), frow.name, "STOP_HIT"
+                    break
+                if frow["High"] >= stop_price:
+                    exit_price, exit_time, exit_reason = stop_price, frow.name, "STOP_HIT"
+                    break
+                if frow["Open"] <= target:
+                    exit_price, exit_time, exit_reason = float(frow["Open"]), frow.name, "TARGET_HIT"
+                    break
+                if frow["Low"] <= target:
+                    exit_price, exit_time, exit_reason = target, frow.name, "TARGET_HIT"
+                    break
 
-                if row["Open"] <= target:
-                    exit_price = float(row["Open"])
-                elif row["Low"] <= target:
-                    exit_price = target
-                else:
-                    exit_price = None
-                if exit_price is not None:
-                    raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
-                                                    entry_price, stop_price, target, row.name,
-                                                    exit_price, "TARGET_HIT"))
-                    in_position = False
-                    continue
+            if (j - entry_idx) >= MAX_HOLD_CANDLES:
+                exit_price, exit_time, exit_reason = float(frow["Close"]), frow.name, "MAX_HOLD_TIME"
+                break
 
-                if (entry_price - float(row["Low"])) / risk >= TRAIL_TO_BE_R:
-                    trailing_stop = min(trailing_stop, entry_price)
-                    lookback_high = float(df.iloc[max(0, i - TRAIL_LOOKBACK_CANDLES):i]["High"].max())
-                    trailing_stop = min(trailing_stop, lookback_high)
-            continue
+        if exit_price is None:
+            # ran out of candles today without any exit condition firing
+            last_row = day_df.iloc[-1]
+            exit_price, exit_time, exit_reason = float(last_row["Close"]), last_row.name, "EOD_SQUAREOFF"
 
-        # --- Not in a position: monitor a pending FVG, or look for a new one ---
-        if pending is not None:
-            candles_waited = i - pending["detected_idx"]
-            if candles_waited > FVG_RETEST_MAX_CANDLES:
-                pending = None
-            else:
-                zone_top, zone_bottom = pending["zone_top"], pending["zone_bottom"]
-                if pending["direction"] == "BULLISH":
-                    # Invalidated if price closes decisively through the zone
-                    if row["Close"] < zone_bottom * (1 - SL_BUFFER_PCT / 100):
-                        pending = None
-                    elif row["Low"] <= zone_top and row["Close"] > row["Open"] and row["Close"] > zone_bottom:
-                        entry_price = float(row["Close"])
-                        stop_price = zone_bottom * (1 - SL_BUFFER_PCT / 100)
-                        risk = entry_price - stop_price
-                        if risk > 0:
-                            c2_range = pending["c2_range"]
-                            measured_target = entry_price + c2_range * MEASURED_MOVE_MULT
-                            rr_target = entry_price + TARGET_RR * risk
-                            target = max(measured_target, rr_target)
-                            trailing_stop = stop_price
-                            direction = "BULLISH"
-                            entry_time = row.name
-                            signal_id = pending["signal_id"]
-                            in_position = True
-                            for s in all_signals:
-                                if s["SignalId"] == signal_id:
-                                    s["EntryTriggered"] = True
-                                    s["EntryTime"] = entry_time.strftime("%H:%M:%S")
-                        pending = None
-                else:  # BEARISH pending
-                    if row["Close"] > zone_top * (1 + SL_BUFFER_PCT / 100):
-                        pending = None
-                    elif row["High"] >= zone_bottom and row["Close"] < row["Open"] and row["Close"] < zone_top:
-                        entry_price = float(row["Close"])
-                        stop_price = zone_top * (1 + SL_BUFFER_PCT / 100)
-                        risk = stop_price - entry_price
-                        if risk > 0:
-                            c2_range = pending["c2_range"]
-                            measured_target = entry_price - c2_range * MEASURED_MOVE_MULT
-                            rr_target = entry_price - TARGET_RR * risk
-                            target = min(measured_target, rr_target)
-                            trailing_stop = stop_price
-                            direction = "BEARISH"
-                            entry_time = row.name
-                            signal_id = pending["signal_id"]
-                            in_position = True
-                            for s in all_signals:
-                                if s["SignalId"] == signal_id:
-                                    s["EntryTriggered"] = True
-                                    s["EntryTime"] = entry_time.strftime("%H:%M:%S")
-                        pending = None
-            if in_position:
-                continue
+        trade = {
+            "SignalId": sig_id,
+            "EntryDate": entry_time.strftime("%Y-%m-%d"), "EntryTime": entry_time.strftime("%H:%M:%S"),
+            "Ticker": ticker, "Direction": direction,
+            "Entry": round(entry_price, 2), "InitialStop": round(stop_price, 2),
+            "Target": round(target, 2), "RiskPerShare": round(risk, 2),
+            "ExitTime": exit_time.strftime("%H:%M:%S"), "ExitPrice": round(exit_price, 2),
+            "ExitReason": exit_reason,
+        }
+        return trade, all_signals  # only one trade per ticker per day
 
-        # --- Look for a brand-new gap (only if not already tracking one) ---
-        if pending is None and i >= 2 and not _time_at_or_after(row_time, NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE):
-            c1 = df.iloc[i - 2]
-            c2 = df.iloc[i - 1]
-            c3 = row  # current candle acts as c3
-
-            avg_body = c2["_avg_body_prior"]
-            avg_vol = c2["_avg_vol"]
-            if pd.isna(avg_body) or pd.isna(avg_vol) or avg_body <= 0:
-                continue
-            c2_body = abs(c2["Close"] - c2["Open"])
-            displaced = c2_body >= DISPLACEMENT_BODY_MULT * avg_body and c2["Volume"] >= DISPLACEMENT_VOL_MULT * avg_vol
-            if not displaced:
-                continue
-
-            price_ref = float(c3["Close"])
-
-            # All 3 candles must share the same direction (per the reference
-            # image): bullish gap needs c1, c2, AND c3 all green; bearish
-            # gap needs all 3 red. A big impulsive c2 alone isn't enough.
-            all_bullish = c1["Close"] > c1["Open"] and c2["Close"] > c2["Open"] and c3["Close"] > c3["Open"]
-            all_bearish = c1["Close"] < c1["Open"] and c2["Close"] < c2["Open"] and c3["Close"] < c3["Open"]
-
-            if c1["High"] < c3["Low"] and all_bullish:
-                gap_pct = (c3["Low"] - c1["High"]) / price_ref * 100
-                if gap_pct >= MIN_GAP_PCT:
-                    is_fvg = c3["Close"] <= c2["High"]  # stays within/touching c2's range
-                    sig_id = str(uuid.uuid4())[:8]
-                    all_signals.append({
-                        "SignalId": sig_id, "Date": row.name.strftime("%Y-%m-%d"),
-                        "DetectedTime": row.name.strftime("%H:%M:%S"), "Ticker": ticker,
-                        "GapType": "FVG" if is_fvg else "BAG (not this strategy)",
-                        "Direction": "BULLISH", "ZoneLow": round(float(c1["High"]), 2),
-                        "ZoneHigh": round(float(c3["Low"]), 2), "EntryTriggered": False,
-                        "EntryTime": "",
-                    })
-                    if is_fvg:
-                        pending = {"direction": "BULLISH", "zone_top": float(c3["Low"]),
-                                   "zone_bottom": float(c1["High"]),
-                                   "c2_range": float(c2["High"] - c2["Low"]),
-                                   "detected_idx": i, "signal_id": sig_id}
-            elif c1["Low"] > c3["High"] and all_bearish:
-                gap_pct = (c1["Low"] - c3["High"]) / price_ref * 100
-                if gap_pct >= MIN_GAP_PCT:
-                    is_fvg = c3["Close"] >= c2["Low"]
-                    sig_id = str(uuid.uuid4())[:8]
-                    all_signals.append({
-                        "SignalId": sig_id, "Date": row.name.strftime("%Y-%m-%d"),
-                        "DetectedTime": row.name.strftime("%H:%M:%S"), "Ticker": ticker,
-                        "GapType": "FVG" if is_fvg else "BAG (not this strategy)",
-                        "Direction": "BEARISH", "ZoneLow": round(float(c3["High"]), 2),
-                        "ZoneHigh": round(float(c1["Low"]), 2), "EntryTriggered": False,
-                        "EntryTime": "",
-                    })
-                    if is_fvg:
-                        pending = {"direction": "BEARISH", "zone_top": float(c1["Low"]),
-                                   "zone_bottom": float(c3["High"]),
-                                   "c2_range": float(c2["High"] - c2["Low"]),
-                                   "detected_idx": i, "signal_id": sig_id}
-
-    return raw_trades, all_signals
-
-
-def _build_trade(signal_id, ticker, direction, entry_time, entry_price, stop_price,
-                  target, exit_time, exit_price, exit_reason):
-    risk = abs(entry_price - stop_price)
-    return {
-        "SignalId": signal_id,
-        "EntryDate": entry_time.strftime("%Y-%m-%d"), "EntryTime": entry_time.strftime("%H:%M:%S"),
-        "Ticker": ticker, "Direction": direction,
-        "Entry": round(entry_price, 2), "InitialStop": round(stop_price, 2),
-        "Target": round(target, 2), "RiskPerShare": round(risk, 2),
-        "ExitTime": exit_time.strftime("%H:%M:%S"), "ExitPrice": round(exit_price, 2),
-        "ExitReason": exit_reason,
-    }
+    return None, all_signals
 
 
 # ------------------------------ POSITION SIZING -----------------------------
@@ -467,31 +384,57 @@ def apply_position_sizing(raw_trades):
     return final_trades, capital, capital_curve, taken_signal_ids
 
 
-def run_backtest(tickers, days):
-    print(f"Fetching {days}-day intraday history for {len(tickers)} tickers...")
-    all_raw_trades, all_signals = [], []
-    usable = 0
+def run_backtest(days):
+    tickers = get_nifty_100_tickers()
+    print(f"Fetching {days}-day intraday + daily history for {len(tickers)} tickers "
+          f"(needed to rank top-{TOP_N_GAINERS} gainers each day)...")
+
+    intraday_data, daily_data = {}, {}
     for i, ticker in enumerate(tickers, 1):
         print(f"  [{i}/{len(tickers)}] {ticker}...")
-        df = fetch_intraday_history(ticker, days)
-        if df is None or len(df) < 100:
-            continue
-        usable += 1
-        try:
-            raw, signals = simulate_ticker(ticker, df)
-            all_raw_trades.extend(raw)
-            all_signals.extend(signals)
-        except Exception as e:
-            print(f"  [warn] simulation error for {ticker}: {e}")
+        idf = fetch_intraday_history(ticker, days)
+        ddf = fetch_daily_history(ticker, days)
+        if idf is not None and ddf is not None:
+            intraday_data[ticker] = idf
+            daily_data[ticker] = ddf
 
-    print(f"\nGot usable data for {usable}/{len(tickers)} tickers. "
-          f"{len(all_signals)} gaps detected ({len(all_raw_trades)} triggered an entry). "
+    print(f"\nGot usable data for {len(intraday_data)}/{len(tickers)} tickers. "
+          f"Building daily top-{TOP_N_GAINERS} rankings...")
+    rankings = build_daily_rankings(daily_data)
+
+    all_raw_trades, all_signals = [], []
+    for day, top_tickers in sorted(rankings.items()):
+        for ticker in top_tickers:
+            idf = intraday_data.get(ticker)
+            ddf = daily_data.get(ticker)
+            if idf is None or ddf is None:
+                continue
+            day_df = idf[idf.index.date == day].copy()
+            if day_df.empty:
+                continue
+            prior_days = ddf[ddf.index.date < day]
+            if prior_days.empty:
+                continue
+            prev = prior_days.iloc[-1]
+            box_high, box_low = float(prev["High"]), float(prev["Low"])
+
+            try:
+                trade, signals = simulate_ticker_day(ticker, day_df, box_high, box_low)
+            except Exception as e:
+                print(f"  [warn] simulation error for {ticker} on {day}: {e}")
+                continue
+
+            all_signals.extend(signals)
+            if trade:
+                all_raw_trades.append(trade)
+
+    print(f"\n{len(all_signals)} wick rejections detected, {len(all_raw_trades)} trades triggered. "
           f"Applying position sizing...")
 
     final_trades, ending_capital, curve, taken_ids = apply_position_sizing(all_raw_trades)
     for s in all_signals:
         s["TakenAsTrade"] = s["SignalId"] in taken_ids
-    return final_trades, ending_capital, curve, all_signals
+    return final_trades, ending_capital, curve, all_signals, rankings
 
 
 # ------------------------------ EXCEL OUTPUT --------------------------------
@@ -499,8 +442,8 @@ def run_backtest(tickers, days):
 TRADE_COLUMNS = ["EntryDate", "EntryTime", "Ticker", "Direction", "Entry", "InitialStop",
                   "Target", "Qty", "RiskAmount", "ExitTime", "ExitPrice", "ExitReason",
                   "Outcome", "PnL", "PnLPct", "CapitalAfter"]
-SIGNAL_COLUMNS = ["Date", "DetectedTime", "Ticker", "GapType", "Direction", "ZoneLow",
-                   "ZoneHigh", "EntryTriggered", "EntryTime", "TakenAsTrade"]
+SIGNAL_COLUMNS = ["Date", "DetectedTime", "Ticker", "Direction", "BoxHigh", "BoxLow",
+                   "EntryTriggered", "EntryTime", "TakenAsTrade"]
 
 
 def max_drawdown_pct(curve):
@@ -513,7 +456,7 @@ def max_drawdown_pct(curve):
     return round(max_dd, 2)
 
 
-def write_excel(trades, starting_capital, ending_capital, capital_curve, all_signals):
+def write_excel(trades, starting_capital, ending_capital, capital_curve, all_signals, rankings):
     wb = Workbook()
     ws = wb.active
     ws.title = "Trades"
@@ -534,10 +477,11 @@ def write_excel(trades, starting_capital, ending_capital, capital_curve, all_sig
         ("Losses", total - wins), ("Win Rate %", win_rate), ("Total P&L", total_pnl),
         ("Max Drawdown %", max_drawdown_pct(capital_curve)),
         ("Risk Per Trade %", RISK_PER_TRADE_PCT), ("Max Daily Risk Cap %", MAX_DAILY_RISK_PCT),
-        ("Total Gaps Detected", len(all_signals)),
-        ("Gaps That Triggered Entry", sum(1 for s in all_signals if s["EntryTriggered"])),
+        ("Top N Gainers Scanned Per Day", TOP_N_GAINERS),
+        ("Total Wick Rejections Detected", len(all_signals)),
         ("No new entries after", f"{NO_ENTRY_AFTER_HOUR}:{NO_ENTRY_AFTER_MINUTE:02d}"),
         ("Mandatory exit by", f"{EXIT_HOUR}:{EXIT_MINUTE:02d}"),
+        ("Max hold candles", MAX_HOLD_CANDLES),
     ]:
         summary_ws.append(row)
 
@@ -558,6 +502,11 @@ def write_excel(trades, starting_capital, ending_capital, capital_curve, all_sig
     for s in sorted(all_signals, key=lambda x: (x["Date"], x["DetectedTime"])):
         signals_ws.append([s.get(c, "") for c in SIGNAL_COLUMNS])
 
+    rankings_ws = wb.create_sheet("DailyTopGainers")
+    rankings_ws.append(["Date", "TopGainerTickers"])
+    for day, tickers in sorted(rankings.items()):
+        rankings_ws.append([day.strftime("%Y-%m-%d"), ", ".join(tickers)])
+
     wb.save(OUTPUT_FILE)
 
 
@@ -567,26 +516,24 @@ backtest_status = {"running": False, "started_at": None, "finished_at": None,
                     "result_summary": None, "error": None}
 
 
-def _run_backtest_background(days, tickers_arg):
+def _run_backtest_background(days):
     backtest_status["running"] = True
     backtest_status["started_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     backtest_status["error"] = None
     try:
-        tickers = ([t.strip() for t in tickers_arg.split(",") if t.strip()]
-                   if tickers_arg else get_nifty_100_tickers())
         days = min(days, MAX_LOOKBACK_DAYS)
-        trades, ending_capital, curve, all_signals = run_backtest(tickers, days)
+        trades, ending_capital, curve, all_signals, rankings = run_backtest(days)
         if trades or all_signals:
-            write_excel(trades, BACKTEST_CAPITAL, ending_capital, curve, all_signals)
+            write_excel(trades, BACKTEST_CAPITAL, ending_capital, curve, all_signals, rankings)
             wins = sum(1 for t in trades if t["Outcome"] == "WIN")
             wr = round(wins / len(trades) * 100, 1) if trades else 0
             backtest_status["result_summary"] = (
                 f"{len(trades)} trades, win rate {wr}%, ended at Rs.{round(ending_capital,2)} "
                 f"(started Rs.{BACKTEST_CAPITAL:,.2f}), max drawdown {max_drawdown_pct(curve)}%, "
-                f"{len(all_signals)} total gaps detected"
+                f"{len(all_signals)} total wick rejections detected"
             )
         else:
-            backtest_status["result_summary"] = "No gaps or trades were generated -- check server logs."
+            backtest_status["result_summary"] = "No signals or trades were generated -- check server logs."
     except Exception as e:
         backtest_status["error"] = str(e)
     finally:
@@ -615,10 +562,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write((
-            "FVG backtest service alive.\n\n"
-            "Visit /run-backtest to start (optional: ?days=30&tickers=RELIANCE.NS,TCS.NS)\n"
+            "Box-Wick (top gainers) backtest service alive.\n\n"
+            "Visit /run-backtest to start (optional: ?days=30)\n"
             "Visit /status to check progress.\n"
-            "Visit /download to get fvg_journal.xlsx once finished.\n"
+            "Visit /download to get box_wick_journal.xlsx once finished.\n"
         ).encode("utf-8"))
 
     def _trigger(self):
@@ -630,8 +577,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         query = parse_qs(urlparse(self.path).query)
         days = int(query.get("days", [MAX_LOOKBACK_DAYS])[0])
-        tickers_arg = query.get("tickers", [None])[0]
-        threading.Thread(target=_run_backtest_background, args=(days, tickers_arg), daemon=True).start()
+        threading.Thread(target=_run_backtest_background, args=(days,), daemon=True).start()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
@@ -655,14 +601,14 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"No fvg_journal.xlsx yet -- visit /run-backtest first.\n")
+            self.wfile.write(b"No box_wick_journal.xlsx yet -- visit /run-backtest first.\n")
             return
         with open(OUTPUT_FILE, "rb") as f:
             data = f.read()
         self.send_response(200)
         self.send_header("Content-Type",
                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        self.send_header("Content-Disposition", "attachment; filename=fvg_journal.xlsx")
+        self.send_header("Content-Disposition", "attachment; filename=box_wick_journal.xlsx")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -675,12 +621,11 @@ def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"FVG backtest server listening on port {port}.")
+    print(f"Box-Wick backtest server listening on port {port}.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest the Fair Value Gap strategy")
-    parser.add_argument("--tickers", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Backtest the Box/Wick rejection strategy on previous-day top gainers")
     parser.add_argument("--days", type=int, default=MAX_LOOKBACK_DAYS)
     parser.add_argument("--once", action="store_true",
                          help="Run once immediately and exit (Shell tab / local use). "
@@ -689,23 +634,21 @@ def main():
 
     if args.once:
         days = min(args.days, MAX_LOOKBACK_DAYS)
-        tickers = ([t.strip() for t in args.tickers.split(",") if t.strip()]
-                   if args.tickers else get_nifty_100_tickers())
-        trades, ending_capital, curve, all_signals = run_backtest(tickers, days)
+        trades, ending_capital, curve, all_signals, rankings = run_backtest(days)
         if not trades and not all_signals:
-            print("\nNo gaps or trades were generated -- check the [warn] lines above.")
+            print("\nNo signals or trades were generated -- check the [warn] lines above.")
             return
-        write_excel(trades, BACKTEST_CAPITAL, ending_capital, curve, all_signals)
+        write_excel(trades, BACKTEST_CAPITAL, ending_capital, curve, all_signals, rankings)
         wins = sum(1 for t in trades if t["Outcome"] == "WIN")
         wr = round(wins / len(trades) * 100, 1) if trades else 0
         print(f"\n{'='*60}\nBACKTEST COMPLETE")
-        print(f"  Total gaps detected: {len(all_signals)}")
-        print(f"  Total trades:        {len(trades)}")
-        print(f"  Win rate:            {wr}%")
-        print(f"  Starting capital:    Rs.{BACKTEST_CAPITAL:,.2f}")
-        print(f"  Ending capital:      Rs.{ending_capital:,.2f}")
-        print(f"  Max drawdown:        {max_drawdown_pct(curve)}%")
-        print(f"  Full detail in:      {OUTPUT_FILE}\n{'='*60}")
+        print(f"  Total wick rejections: {len(all_signals)}")
+        print(f"  Total trades:          {len(trades)}")
+        print(f"  Win rate:              {wr}%")
+        print(f"  Starting capital:      Rs.{BACKTEST_CAPITAL:,.2f}")
+        print(f"  Ending capital:        Rs.{ending_capital:,.2f}")
+        print(f"  Max drawdown:          {max_drawdown_pct(curve)}%")
+        print(f"  Full detail in:        {OUTPUT_FILE}\n{'='*60}")
         return
 
     start_web_server()
