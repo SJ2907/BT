@@ -87,7 +87,14 @@ MAX_LOOKBACK_DAYS = 59
 
 RSI_PERIOD = 14
 RSI_OVERSOLD_THRESHOLD = 25
-RSI_OVERSOLD_CONSECUTIVE = 7   # candles in a row below the threshold
+RSI_OVERBOUGHT_THRESHOLD = 75   # NEW: mirror threshold for bearish/short setups
+RSI_OVERSOLD_LOOKBACK = 15   # look at the last N candles for an oversold touch.
+                              # Widened from 7 -- even with the touch-based
+                              # relaxation, 7 candles (35 min) still rolled
+                              # past the oversold touch just before the
+                              # slower EMA20/EMA44/VWAP conditions caught up
+                              # in testing. 15 candles (~75 min) gives real
+                              # overlap room without being unreasonably loose.
 
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
@@ -95,7 +102,16 @@ VOL_RSI_MIN, VOL_RSI_MAX = 40, 55
 
 EMA_FAST, EMA_MED, EMA_SLOW = 5, 20, 44
 
-STOP_PCT = 1.0     # fixed 1% stop below entry
+# --- NEW: market-direction filter ---
+# Only take BULLISH (long) setups when the broader market is itself
+# bullish, and only take BEARISH (short) setups when the broader market is
+# itself bearish. The idea: don't fight the overall tape on an individual
+# stock trade -- this should reduce losses from taking a "good-looking"
+# setup that's actually going against the day's real market direction.
+MARKET_INDEX_TICKER = "^NSEI"      # Nifty 50 index, used as the market proxy
+MARKET_REGIME_EMA_PERIOD = 20      # index Close vs this EMA determines regime
+
+STOP_PCT = 1.0     # fixed 1% stop below entry (mirrored: above entry for shorts)
 TARGET_RR = 2.0    # 1:2 risk:reward
 
 NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE = 12, 30
@@ -105,6 +121,7 @@ IST = pytz.timezone("Asia/Kolkata")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE = os.path.join(SCRIPT_DIR, "l99_journal.xlsx")
 NIFTY100_SOURCE_URL = "https://niftyindices.com/IndexConstituent/ind_nifty100list.csv"
+NIFTY200_SOURCE_URL = "https://niftyindices.com/IndexConstituent/ind_nifty200list.csv"
 
 FALLBACK_TICKERS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
@@ -131,6 +148,26 @@ def get_nifty_100_tickers():
         return FALLBACK_TICKERS
 
 
+def get_nifty_200_tickers():
+    """NEW: broader universe than the other backtests (which use Nifty 100).
+    Nifty 200 = Nifty 100 + Nifty Midcap 100, so this doubles the number of
+    stocks scanned -- more chances for a rare setup like this one to fire."""
+    try:
+        resp = requests.get(NIFTY200_SOURCE_URL,
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        symbol_col = "Symbol" if "Symbol" in df.columns else df.columns[2]
+        tickers = [f"{s.strip()}.NS" for s in df[symbol_col].dropna().tolist()]
+        if len(tickers) < 180:
+            raise ValueError(f"Only got {len(tickers)} tickers, expected ~200")
+        print(f"Fetched live Nifty 200 list: {len(tickers)} tickers.")
+        return tickers
+    except Exception as e:
+        print(f"[warn] Live Nifty 200 fetch failed ({e}). Falling back to Nifty 100 instead.")
+        return get_nifty_100_tickers()
+
+
 def fetch_intraday_history(ticker, days):
     try:
         df = yf.download(ticker, period=f"{days}d", interval=CANDLE_INTERVAL,
@@ -143,6 +180,26 @@ def fetch_intraday_history(ticker, days):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
+
+def build_market_regime(days):
+    """Fetches the Nifty 50 index itself and classifies each candle as
+    BULLISH or BEARISH regime (index Close vs its own EMA). Returns a dict
+    {timestamp: "BULLISH"/"BEARISH"} for fast lookup while simulating
+    individual stocks."""
+    idx_df = fetch_intraday_history(MARKET_INDEX_TICKER, days)
+    if idx_df is None or idx_df.empty:
+        print(f"  [warn] could not fetch market index {MARKET_INDEX_TICKER} -- "
+              f"market-direction filter will be skipped (all trades allowed).")
+        return {}
+    idx_df["RegimeEMA"] = idx_df["Close"].ewm(span=MARKET_REGIME_EMA_PERIOD, adjust=False).mean()
+    regime = {}
+    for ts, row in idx_df.iterrows():
+        regime[ts] = "BULLISH" if row["Close"] > row["RegimeEMA"] else "BEARISH"
+    print(f"Market regime built from {MARKET_INDEX_TICKER}: "
+          f"{sum(1 for v in regime.values() if v=='BULLISH')} bullish candles, "
+          f"{sum(1 for v in regime.values() if v=='BEARISH')} bearish candles.")
+    return regime
 
 
 # ------------------------------ INDICATORS ---------------------------------
@@ -189,14 +246,19 @@ def _time_at_or_after(row_time, hour, minute):
 
 # ------------------------------ STRATEGY CORE ------------------------------
 
-def simulate_ticker(ticker, df):
+def simulate_ticker(ticker, df, market_regime):
     """Runs the full multi-day series for one ticker. Returns
-    (raw_trades, all_signals)."""
+    (raw_trades, all_signals). `market_regime` is a {timestamp: "BULLISH"/
+    "BEARISH"} dict from build_market_regime() -- bullish (long) setups
+    only fire when the regime is BULLISH, bearish (short) setups only fire
+    when the regime is BEARISH. If market_regime is empty (index fetch
+    failed), the filter is skipped and both directions are always allowed."""
     df = precompute_indicators(df)
     raw_trades = []
     all_signals = []
 
     in_position = False
+    direction = None
     entry_price = stop_price = target = entry_time = None
     signal_id = None
     current_day = None
@@ -211,33 +273,45 @@ def simulate_ticker(ticker, df):
             current_day = row_day
             in_position = False
 
-        if i < RSI_OVERSOLD_CONSECUTIVE + 5:
-            continue  # not enough history yet for the 7-candle RSI check
+        if i < RSI_OVERSOLD_LOOKBACK + 5:
+            continue  # not enough history yet for the RSI lookback check
 
         if in_position:
             if _time_at_or_after(row_time, EXIT_HOUR, EXIT_MINUTE):
                 exit_price = float(row["Close"])
-                raw_trades.append(_build_trade(signal_id, ticker, entry_time, entry_price,
-                                                stop_price, target, row.name, exit_price,
-                                                "EOD_SQUAREOFF"))
+                raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
+                                                entry_price, stop_price, target, row.name,
+                                                exit_price, "EOD_SQUAREOFF"))
                 in_position = False
                 continue
 
-            # Check High/Low touches, not just Close
-            if row["Open"] <= stop_price:
-                exit_price, reason = float(row["Open"]), "STOP_HIT"
-            elif row["Low"] <= stop_price:
-                exit_price, reason = stop_price, "STOP_HIT"
-            elif row["Open"] >= target:
-                exit_price, reason = float(row["Open"]), "TARGET_HIT"
-            elif row["High"] >= target:
-                exit_price, reason = target, "TARGET_HIT"
-            else:
-                exit_price, reason = None, None
+            if direction == "BULLISH":
+                if row["Open"] <= stop_price:
+                    exit_price, reason = float(row["Open"]), "STOP_HIT"
+                elif row["Low"] <= stop_price:
+                    exit_price, reason = stop_price, "STOP_HIT"
+                elif row["Open"] >= target:
+                    exit_price, reason = float(row["Open"]), "TARGET_HIT"
+                elif row["High"] >= target:
+                    exit_price, reason = target, "TARGET_HIT"
+                else:
+                    exit_price, reason = None, None
+            else:  # BEARISH
+                if row["Open"] >= stop_price:
+                    exit_price, reason = float(row["Open"]), "STOP_HIT"
+                elif row["High"] >= stop_price:
+                    exit_price, reason = stop_price, "STOP_HIT"
+                elif row["Open"] <= target:
+                    exit_price, reason = float(row["Open"]), "TARGET_HIT"
+                elif row["Low"] <= target:
+                    exit_price, reason = target, "TARGET_HIT"
+                else:
+                    exit_price, reason = None, None
 
             if exit_price is not None:
-                raw_trades.append(_build_trade(signal_id, ticker, entry_time, entry_price,
-                                                stop_price, target, row.name, exit_price, reason))
+                raw_trades.append(_build_trade(signal_id, ticker, direction, entry_time,
+                                                entry_price, stop_price, target, row.name,
+                                                exit_price, reason))
                 in_position = False
             continue
 
@@ -245,26 +319,44 @@ def simulate_ticker(ticker, df):
         if _time_at_or_after(row_time, NO_ENTRY_AFTER_HOUR, NO_ENTRY_AFTER_MINUTE):
             continue
 
-        rsi_window = df["RSI"].iloc[i - RSI_OVERSOLD_CONSECUTIVE:i]
-        if pd.isna(rsi_window).any() or len(rsi_window) < RSI_OVERSOLD_CONSECUTIVE:
-            continue
-        rsi_oversold = (rsi_window < RSI_OVERSOLD_THRESHOLD).all()
-        if not rsi_oversold:
-            continue
+        # NEW: market-direction filter. Empty dict (index fetch failed)
+        # means "no filter" -- default to allowing both directions.
+        regime = market_regime.get(row.name) if market_regime else None
+        market_allows_bullish = (regime is None) or (regime == "BULLISH")
+        market_allows_bearish = (regime is None) or (regime == "BEARISH")
 
-        prev = df.iloc[i - 1]
-        macd_cross = (row["MACD"] > row["MACD_SIGNAL"]) and (prev["MACD"] <= prev["MACD_SIGNAL"])
-        if not macd_cross:
+        rsi_window = df["RSI"].iloc[i - RSI_OVERSOLD_LOOKBACK:i]
+        if pd.isna(rsi_window).any() or len(rsi_window) < RSI_OVERSOLD_LOOKBACK:
             continue
 
         if pd.isna(row["VolRSI"]) or not (VOL_RSI_MIN <= row["VolRSI"] <= VOL_RSI_MAX):
             continue
 
-        ema_aligned = row["Close"] > row["EMA_FAST"] and row["Close"] > row["EMA_MED"] and row["Close"] > row["EMA_SLOW"]
-        if not ema_aligned:
-            continue
+        this_direction = None
 
-        if not (row["Close"] > row["VWAP"]):
+        # --- BULLISH (long) setup -- only if market regime allows it ---
+        if market_allows_bullish:
+            rsi_touched_oversold = (rsi_window < RSI_OVERSOLD_THRESHOLD).any()
+            macd_bullish = row["MACD"] > row["MACD_SIGNAL"]
+            ema_aligned_up = (row["Close"] > row["EMA_FAST"] and row["Close"] > row["EMA_MED"]
+                              and row["Close"] > row["EMA_SLOW"])
+            vwap_above = row["Close"] > row["VWAP"]
+            if rsi_touched_oversold and macd_bullish and ema_aligned_up and vwap_above:
+                this_direction = "BULLISH"
+
+        # --- BEARISH (short) setup -- mirror of the above, only if market
+        # regime allows it. Not in the original reference -- added per
+        # instruction to trade both directions based on market direction. ---
+        if this_direction is None and market_allows_bearish:
+            rsi_touched_overbought = (rsi_window > RSI_OVERBOUGHT_THRESHOLD).any()
+            macd_bearish = row["MACD"] < row["MACD_SIGNAL"]
+            ema_aligned_down = (row["Close"] < row["EMA_FAST"] and row["Close"] < row["EMA_MED"]
+                                and row["Close"] < row["EMA_SLOW"])
+            vwap_below = row["Close"] < row["VWAP"]
+            if rsi_touched_overbought and macd_bearish and ema_aligned_down and vwap_below:
+                this_direction = "BEARISH"
+
+        if this_direction is None:
             continue
 
         # All conditions met -- signal!
@@ -272,14 +364,21 @@ def simulate_ticker(ticker, df):
         all_signals.append({
             "SignalId": sig_id, "Date": row.name.strftime("%Y-%m-%d"),
             "DetectedTime": row.name.strftime("%H:%M:%S"), "Ticker": ticker,
+            "Direction": this_direction, "MarketRegime": regime if regime else "N/A",
             "RSI": round(float(row["RSI"]), 1), "VolRSI": round(float(row["VolRSI"]), 1),
             "EntryTriggered": True, "EntryTime": row.name.strftime("%H:%M:%S"),
         })
 
         entry_price = float(row["Close"])
-        stop_price = entry_price * (1 - STOP_PCT / 100)
-        risk = entry_price - stop_price
-        target = entry_price + TARGET_RR * risk
+        if this_direction == "BULLISH":
+            stop_price = entry_price * (1 - STOP_PCT / 100)
+            risk = entry_price - stop_price
+            target = entry_price + TARGET_RR * risk
+        else:
+            stop_price = entry_price * (1 + STOP_PCT / 100)
+            risk = stop_price - entry_price
+            target = entry_price - TARGET_RR * risk
+        direction = this_direction
         entry_time = row.name
         signal_id = sig_id
         in_position = True
@@ -287,11 +386,11 @@ def simulate_ticker(ticker, df):
     return raw_trades, all_signals
 
 
-def _build_trade(signal_id, ticker, entry_time, entry_price, stop_price, target,
+def _build_trade(signal_id, ticker, direction, entry_time, entry_price, stop_price, target,
                   exit_time, exit_price, exit_reason):
-    risk = entry_price - stop_price
+    risk = abs(entry_price - stop_price)
     return {
-        "SignalId": signal_id,
+        "SignalId": signal_id, "Direction": direction,
         "EntryDate": entry_time.strftime("%Y-%m-%d"), "EntryTime": entry_time.strftime("%H:%M:%S"),
         "Ticker": ticker,
         "Entry": round(entry_price, 2), "InitialStop": round(stop_price, 2),
@@ -329,7 +428,10 @@ def apply_position_sizing(raw_trades):
             if qty == 0:
                 continue
 
-            pnl = (t["ExitPrice"] - t["Entry"]) * qty
+            if t["Direction"] == "BULLISH":
+                pnl = (t["ExitPrice"] - t["Entry"]) * qty
+            else:
+                pnl = (t["Entry"] - t["ExitPrice"]) * qty
             pnl_pct = round((pnl / (t["Entry"] * qty)) * 100, 2) if t["Entry"] * qty else 0
             outcome = "WIN" if pnl > 0 else "LOSS"
 
@@ -357,6 +459,9 @@ def apply_position_sizing(raw_trades):
 
 
 def run_backtest(tickers, days):
+    print(f"Building market-direction regime from {MARKET_INDEX_TICKER}...")
+    market_regime = build_market_regime(days)
+
     print(f"Fetching {days}-day intraday history for {len(tickers)} tickers...")
     all_raw_trades, all_signals = [], []
     usable = 0
@@ -367,7 +472,7 @@ def run_backtest(tickers, days):
             continue
         usable += 1
         try:
-            raw, signals = simulate_ticker(ticker, df)
+            raw, signals = simulate_ticker(ticker, df, market_regime)
             all_raw_trades.extend(raw)
             all_signals.extend(signals)
         except Exception as e:
@@ -384,11 +489,11 @@ def run_backtest(tickers, days):
 
 # ------------------------------ EXCEL OUTPUT --------------------------------
 
-TRADE_COLUMNS = ["EntryDate", "EntryTime", "Ticker", "Entry", "InitialStop", "Target",
-                  "Qty", "RiskAmount", "ExitTime", "ExitPrice", "ExitReason", "Outcome",
-                  "PnL", "PnLPct", "CapitalAfter"]
-SIGNAL_COLUMNS = ["Date", "DetectedTime", "Ticker", "RSI", "VolRSI", "EntryTriggered",
-                   "EntryTime", "TakenAsTrade"]
+TRADE_COLUMNS = ["EntryDate", "EntryTime", "Ticker", "Direction", "Entry", "InitialStop",
+                  "Target", "Qty", "RiskAmount", "ExitTime", "ExitPrice", "ExitReason",
+                  "Outcome", "PnL", "PnLPct", "CapitalAfter"]
+SIGNAL_COLUMNS = ["Date", "DetectedTime", "Ticker", "Direction", "MarketRegime", "RSI",
+                   "VolRSI", "EntryTriggered", "EntryTime", "TakenAsTrade"]
 
 
 def max_drawdown_pct(curve):
@@ -441,6 +546,24 @@ def write_excel(trades, starting_capital, ending_capital, capital_curve, all_sig
         wr = round(s["wins"] / s["trades"] * 100, 2) if s["trades"] else 0
         symbol_ws.append([ticker, s["trades"], s["wins"], wr, round(s["pnl"], 2)])
 
+    # Separate Bullish / Bearish sheets, each with their own win rate up top
+    for direction_label, sheet_name in [("BULLISH", "Bullish"), ("BEARISH", "Bearish")]:
+        subset = [t for t in trades if t["Direction"] == direction_label]
+        d_ws = wb.create_sheet(sheet_name)
+        d_wins = sum(1 for t in subset if t["Outcome"] == "WIN")
+        d_total = len(subset)
+        d_win_rate = round(d_wins / d_total * 100, 2) if d_total else 0
+        d_pnl = round(sum(t["PnL"] for t in subset), 2)
+        d_ws.append(["Total Trades", d_total])
+        d_ws.append(["Wins", d_wins])
+        d_ws.append(["Losses", d_total - d_wins])
+        d_ws.append(["Win Rate %", d_win_rate])
+        d_ws.append(["Total P&L", d_pnl])
+        d_ws.append([])
+        d_ws.append(TRADE_COLUMNS)
+        for t in subset:
+            d_ws.append([t.get(c, "") for c in TRADE_COLUMNS])
+
     signals_ws = wb.create_sheet("AllSignals")
     signals_ws.append(SIGNAL_COLUMNS)
     for s in sorted(all_signals, key=lambda x: (x["Date"], x["DetectedTime"])):
@@ -461,7 +584,7 @@ def _run_backtest_background(days, tickers_arg):
     backtest_status["error"] = None
     try:
         tickers = ([t.strip() for t in tickers_arg.split(",") if t.strip()]
-                   if tickers_arg else get_nifty_100_tickers())
+                   if tickers_arg else get_nifty_200_tickers())
         days = min(days, MAX_LOOKBACK_DAYS)
         trades, ending_capital, curve, all_signals = run_backtest(tickers, days)
         if trades or all_signals:
@@ -578,7 +701,7 @@ def main():
     if args.once:
         days = min(args.days, MAX_LOOKBACK_DAYS)
         tickers = ([t.strip() for t in args.tickers.split(",") if t.strip()]
-                   if args.tickers else get_nifty_100_tickers())
+                   if args.tickers else get_nifty_200_tickers())
         trades, ending_capital, curve, all_signals = run_backtest(tickers, days)
         if not trades and not all_signals:
             print("\nNo signals or trades were generated -- check the [warn] lines above.")
